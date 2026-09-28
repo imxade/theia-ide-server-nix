@@ -1,0 +1,82 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+root="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/.." && pwd)"
+cd "$root"
+
+package="${THEIA_PACKAGE:-theia-ide-server}"
+
+for cmd in nix curl python3; do
+  command -v "$cmd" >/dev/null 2>&1 || {
+    echo "required command not found: $cmd" >&2
+    exit 1
+  }
+done
+
+port="$(python3 - <<'PY'
+import socket
+s = socket.socket()
+s.bind(('127.0.0.1', 0))
+print(s.getsockname()[1])
+s.close()
+PY
+)"
+
+tmp="$(mktemp -d)"
+workspace="$tmp/workspace"
+home="$tmp/home"
+log="$tmp/theia.log"
+mkdir -p "$workspace" "$home"
+
+cleanup() {
+  if [[ -n "${pid:-}" ]] && kill -0 "$pid" 2>/dev/null; then
+    kill "$pid" 2>/dev/null || true
+    wait "$pid" 2>/dev/null || true
+  fi
+  rm -rf "$tmp"
+}
+trap cleanup EXIT INT TERM
+
+HOME="$home" XDG_CONFIG_HOME="$home/config" XDG_DATA_HOME="$home/data" \
+  nix run ".#$package" -- \
+    "$workspace" \
+    --hostname=127.0.0.1 \
+    --port="$port" \
+    --no-cluster \
+    >"$log" 2>&1 &
+pid=$!
+
+ready=0
+started_at="$(date +%s)"
+for _ in $(seq 1 120); do
+  if ! kill -0 "$pid" 2>/dev/null; then
+    echo "Theia exited before becoming ready" >&2
+    cat "$log" >&2
+    exit 1
+  fi
+  if curl --fail --silent --show-error --max-time 2 "http://127.0.0.1:$port/" -o "$tmp/index.html"; then
+    ready=1
+    break
+  fi
+  sleep 1
+done
+
+if (( ready == 0 )); then
+  echo "Theia did not become ready within 120 seconds" >&2
+  cat "$log" >&2
+  exit 1
+fi
+
+[[ -s "$tmp/index.html" ]] || {
+  echo "Theia returned an empty HTML response" >&2
+  exit 1
+}
+
+sleep 2
+rss_kib="$(ps -o rss= -p "$pid" 2>/dev/null | tr -d ' ' || true)"
+ready_at="$(date +%s)"
+printf 'Theia localhost smoke test passed: http://127.0.0.1:%s/\n' "$port"
+printf 'startup-to-HTTP-ready: %s seconds\n' "$((ready_at - started_at))"
+if [[ -n "$rss_kib" ]]; then
+  printf 'launcher process RSS at readiness: %s KiB\n' "$rss_kib"
+fi

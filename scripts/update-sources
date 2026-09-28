@@ -1,0 +1,165 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+root="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/.." && pwd)"
+cd "$root"
+
+if [[ ! -f "$root/flake.lock" ]]; then
+  echo "creating initial flake.lock" >&2
+  nix flake lock
+fi
+
+repo="https://github.com/eclipse-theia/theia-ide.git"
+source_file="$root/source.nix"
+fake_hash='sha256-AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA='
+
+need() {
+  command -v "$1" >/dev/null 2>&1 || {
+    echo "required command not found: $1" >&2
+    exit 1
+  }
+}
+
+for cmd in git curl jq nix sed sort awk grep; do
+  need "$cmd"
+done
+
+latest_version="$({
+  git ls-remote --refs --tags "$repo" 'v*' \
+    | awk '{print $2}' \
+    | sed -nE 's#refs/tags/v([0-9]+\.[0-9]+\.[0-9]+)$#\1#p'
+} | sort -V | tail -n1)"
+
+[[ -n "$latest_version" ]] || {
+  echo "unable to discover a stable vX.Y.Z tag" >&2
+  exit 1
+}
+
+# Confirm the tag itself describes the same stable IDE version and still expects
+# a modern Node runtime. This also rejects unrelated numeric tags.
+root_manifest="$(curl --fail --silent --show-error --location \
+  "https://raw.githubusercontent.com/eclipse-theia/theia-ide/v${latest_version}/package.json")"
+browser_manifest="$(curl --fail --silent --show-error --location \
+  "https://raw.githubusercontent.com/eclipse-theia/theia-ide/v${latest_version}/applications/browser/package.json")"
+
+root_version="$(jq -r '.version' <<<"$root_manifest")"
+browser_version="$(jq -r '.version' <<<"$browser_manifest")"
+[[ "$root_version" == "$latest_version" && "$browser_version" == "$latest_version" ]] || {
+  echo "tag/version mismatch: tag=$latest_version root=$root_version browser=$browser_version" >&2
+  exit 1
+}
+
+extract_got_hash() {
+  sed -nE 's/.*got:[[:space:]]*(sha256-[A-Za-z0-9+\/=]+).*/\1/p' | tail -n1
+}
+
+prefetch_source_hash() {
+  local version="$1" output status hash
+  set +e
+  output="$(nix build --impure --no-link --expr "
+    let
+      flake = builtins.getFlake \"$root\";
+      pkgs = import flake.inputs.nixpkgs { system = builtins.currentSystem; };
+    in pkgs.fetchFromGitHub {
+      owner = \"eclipse-theia\";
+      repo = \"theia-ide\";
+      rev = \"v${version}\";
+      hash = pkgs.lib.fakeHash;
+    }
+  " 2>&1)"
+  status=$?
+  set -e
+  if (( status == 0 )); then
+    echo "unexpectedly matched fake source hash" >&2
+    return 1
+  fi
+  hash="$(extract_got_hash <<<"$output")"
+  [[ -n "$hash" ]] || {
+    printf '%s\n' "$output" >&2
+    echo "could not extract source hash from Nix output" >&2
+    return 1
+  }
+  printf '%s\n' "$hash"
+}
+
+prefetch_yarn_hash() {
+  local version="$1" src_hash="$2" output status hash
+  set +e
+  output="$(nix build --impure --no-link --expr "
+    let
+      flake = builtins.getFlake \"$root\";
+      pkgs = import flake.inputs.nixpkgs { system = builtins.currentSystem; };
+      src = pkgs.fetchFromGitHub {
+        owner = \"eclipse-theia\";
+        repo = \"theia-ide\";
+        rev = \"v${version}\";
+        hash = \"${src_hash}\";
+      };
+    in pkgs.fetchYarnDeps {
+      yarnLock = src + \"/yarn.lock\";
+      hash = pkgs.lib.fakeHash;
+    }
+  " 2>&1)"
+  status=$?
+  set -e
+  if (( status == 0 )); then
+    echo "unexpectedly matched fake Yarn dependency hash" >&2
+    return 1
+  fi
+  hash="$(extract_got_hash <<<"$output")"
+  [[ -n "$hash" ]] || {
+    printf '%s\n' "$output" >&2
+    echo "could not extract Yarn dependency hash from Nix output" >&2
+    return 1
+  }
+  printf '%s\n' "$hash"
+}
+
+old_version=""
+old_src_hash=""
+old_yarn_hash=""
+if [[ -f "$source_file" ]]; then
+  old_version="$(nix eval --raw --file "$source_file" version 2>/dev/null || true)"
+  old_src_hash="$(nix eval --raw --file "$source_file" srcHash 2>/dev/null || true)"
+  old_yarn_hash="$(nix eval --raw --file "$source_file" yarnHash 2>/dev/null || true)"
+fi
+
+printf 'latest stable Theia IDE: %s\n' "$latest_version"
+src_hash="$(prefetch_source_hash "$latest_version")"
+
+if [[ "$old_version" == "$latest_version" && "$old_src_hash" != "$fake_hash" && "$old_src_hash" != "$src_hash" ]]; then
+  echo "refusing tag mutation for v${latest_version}: source hash changed" >&2
+  echo "old: $old_src_hash" >&2
+  echo "new: $src_hash" >&2
+  exit 1
+fi
+
+if [[ "$old_version" == "$latest_version" && "$old_yarn_hash" != "$fake_hash" && -n "$old_yarn_hash" ]]; then
+  yarn_hash="$old_yarn_hash"
+else
+  yarn_hash="$(prefetch_yarn_hash "$latest_version" "$src_hash")"
+fi
+
+for hash in "$src_hash" "$yarn_hash"; do
+  [[ "$hash" =~ ^sha256-[A-Za-z0-9+/]{43}=$ ]] || {
+    echo "invalid computed hash: $hash" >&2
+    exit 1
+  }
+done
+
+tmp="$(mktemp "$root/.source.nix.XXXXXX")"
+trap 'rm -f "$tmp"' EXIT
+cat >"$tmp" <<EOF_NIX
+{
+  version = "$latest_version";
+  srcHash = "$src_hash";
+  yarnHash = "$yarn_hash";
+}
+EOF_NIX
+
+nix-instantiate --parse "$tmp" >/dev/null
+mv "$tmp" "$source_file"
+trap - EXIT
+
+nix fmt "$source_file" >/dev/null
+printf 'updated source.nix: Theia IDE %s\n' "$latest_version"

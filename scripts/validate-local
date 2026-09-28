@@ -1,0 +1,26 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+root="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/.." && pwd)"
+cd "$root"
+
+./scripts/check-sources
+
+nix develop --command bash -c '
+  set -euo pipefail
+  shellcheck scripts/check-sources scripts/update-sources scripts/smoke-test scripts/validate-local
+  actionlint .github/workflows/*.yml
+'
+
+nix fmt -- --check
+nix flake show
+nix flake check --print-build-logs
+nix build .#theia-ide-server --print-build-logs
+
+test -x result/bin/theia-ide-server
+./scripts/smoke-test
+
+if [[ "${THEIA_TEST_PROD:-0}" == "1" ]]; then
+  nix build .#theia-ide-server-prod --print-build-logs
+  THEIA_PACKAGE=theia-ide-server-prod ./scripts/smoke-test
+fi
