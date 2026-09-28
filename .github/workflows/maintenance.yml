@@ -21,7 +21,7 @@ jobs:
 
       - name: Refresh nixpkgs and Theia metadata
         run: |
-          nix flake update nixpkgs
+          nix --extra-experimental-features 'nix-command flakes' flake update nixpkgs
           nix develop --command ./scripts/update-sources
 
       - name: Validate maintained repository

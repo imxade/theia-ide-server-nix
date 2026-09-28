@@ -20,9 +20,22 @@ need() {
   }
 }
 
-for cmd in git curl jq nix sed sort awk grep; do
+for cmd in git curl nix sed sort awk grep; do
   need "$cmd"
 done
+
+if ! command -v jq >/dev/null 2>&1 && ! command -v python3 >/dev/null 2>&1; then
+  echo "either jq or python3 is required to parse manifest JSON" >&2
+  exit 1
+fi
+
+get_manifest_version() {
+  if command -v jq >/dev/null 2>&1; then
+    jq -r '.version'
+  else
+    python3 -c 'import sys, json; print(json.load(sys.stdin).get("version", ""))'
+  fi
+}
 
 latest_version="$({
   git ls-remote --refs --tags "$repo" 'v*' \
@@ -42,8 +55,8 @@ root_manifest="$(curl --fail --silent --show-error --location \
 browser_manifest="$(curl --fail --silent --show-error --location \
   "https://raw.githubusercontent.com/eclipse-theia/theia-ide/v${latest_version}/applications/browser/package.json")"
 
-root_version="$(jq -r '.version' <<<"$root_manifest")"
-browser_version="$(jq -r '.version' <<<"$browser_manifest")"
+root_version="$(get_manifest_version <<<"$root_manifest")"
+browser_version="$(get_manifest_version <<<"$browser_manifest")"
 [[ "$root_version" == "$latest_version" && "$browser_version" == "$latest_version" ]] || {
   echo "tag/version mismatch: tag=$latest_version root=$root_version browser=$browser_version" >&2
   exit 1
@@ -56,7 +69,7 @@ extract_got_hash() {
 prefetch_source_hash() {
   local version="$1" output status hash
   set +e
-  output="$(nix build --impure --no-link --expr "
+  output="$(nix --extra-experimental-features 'nix-command flakes' build --impure --no-link --expr "
     let
       flake = builtins.getFlake \"$root\";
       pkgs = import flake.inputs.nixpkgs { system = builtins.currentSystem; };
@@ -85,7 +98,7 @@ prefetch_source_hash() {
 prefetch_yarn_hash() {
   local version="$1" src_hash="$2" output status hash
   set +e
-  output="$(nix build --impure --no-link --expr "
+  output="$(nix --extra-experimental-features 'nix-command flakes' build --impure --no-link --expr "
     let
       flake = builtins.getFlake \"$root\";
       pkgs = import flake.inputs.nixpkgs { system = builtins.currentSystem; };
@@ -119,9 +132,15 @@ old_version=""
 old_src_hash=""
 old_yarn_hash=""
 if [[ -f "$source_file" ]]; then
-  old_version="$(nix eval --raw --file "$source_file" version 2>/dev/null || true)"
-  old_src_hash="$(nix eval --raw --file "$source_file" srcHash 2>/dev/null || true)"
-  old_yarn_hash="$(nix eval --raw --file "$source_file" yarnHash 2>/dev/null || true)"
+  if command -v nix-instantiate >/dev/null 2>&1; then
+    old_version="$(nix-instantiate --eval --expr "(import $source_file).version" 2>/dev/null | tr -d '"' || true)"
+    old_src_hash="$(nix-instantiate --eval --expr "(import $source_file).srcHash" 2>/dev/null | tr -d '"' || true)"
+    old_yarn_hash="$(nix-instantiate --eval --expr "(import $source_file).yarnHash" 2>/dev/null | tr -d '"' || true)"
+  else
+    old_version="$(nix --extra-experimental-features 'nix-command flakes' eval --raw --file "$source_file" version 2>/dev/null || true)"
+    old_src_hash="$(nix --extra-experimental-features 'nix-command flakes' eval --raw --file "$source_file" srcHash 2>/dev/null || true)"
+    old_yarn_hash="$(nix --extra-experimental-features 'nix-command flakes' eval --raw --file "$source_file" yarnHash 2>/dev/null || true)"
+  fi
 fi
 
 printf 'latest stable Theia IDE: %s\n' "$latest_version"

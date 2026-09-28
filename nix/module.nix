@@ -1,14 +1,25 @@
-{ config, lib, pkgs, ... }:
+{
+  config,
+  lib,
+  pkgs,
+  ...
+}:
 
 let
   cfg = config.services.theia-ide-server;
-  inherit (lib) mkEnableOption mkIf mkOption types;
+  inherit (lib)
+    mkEnableOption
+    mkIf
+    mkOption
+    types
+    ;
   args = [
     cfg.workspace
     "--hostname=${cfg.host}"
     "--port=${toString cfg.port}"
     "--no-cluster"
-  ] ++ cfg.extraArgs;
+  ]
+  ++ cfg.extraArgs;
   escapedArgs = lib.escapeShellArgs args;
 in
 {
@@ -17,7 +28,9 @@ in
 
     package = mkOption {
       type = types.package;
-      default = pkgs.theia-ide-server or (throw "services.theia-ide-server.package must be set when the overlay is not imported");
+      default =
+        pkgs.theia-ide-server
+          or (throw "services.theia-ide-server.package must be set when the overlay is not imported");
       description = "The native Theia IDE server package to run.";
     };
 
@@ -105,13 +118,16 @@ in
       after = [ "network.target" ];
       wantedBy = [ "multi-user.target" ];
 
-      environment = cfg.environment // {
-        HOME = "/var/lib/theia-ide-server";
-        XDG_CONFIG_HOME = "/var/lib/theia-ide-server/config";
-        XDG_DATA_HOME = "/var/lib/theia-ide-server/data";
-      } // lib.optionalAttrs (cfg.nodeOptions != null) {
-        NODE_OPTIONS = cfg.nodeOptions;
-      };
+      environment =
+        cfg.environment
+        // {
+          HOME = "/var/lib/theia-ide-server";
+          XDG_CONFIG_HOME = "/var/lib/theia-ide-server/config";
+          XDG_DATA_HOME = "/var/lib/theia-ide-server/data";
+        }
+        // lib.optionalAttrs (cfg.nodeOptions != null) {
+          NODE_OPTIONS = cfg.nodeOptions;
+        };
 
       serviceConfig = {
         Type = "simple";
@@ -127,7 +143,10 @@ in
         NoNewPrivileges = true;
         PrivateTmp = true;
         ProtectSystem = "strict";
-        ReadWritePaths = [ "/var/lib/theia-ide-server" cfg.workspace ];
+        ReadWritePaths = [
+          "/var/lib/theia-ide-server"
+          cfg.workspace
+        ];
         UMask = "0077";
       };
     };

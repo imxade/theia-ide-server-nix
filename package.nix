@@ -6,6 +6,7 @@
   yarnConfigHook,
   nodejs,
   yarn,
+  node-gyp,
   python3,
   pkg-config,
   makeWrapper,
@@ -14,7 +15,7 @@
   openssh,
   libsecret,
   libxkbfile,
-  xorg,
+  libx11,
   source,
   production ? false,
 }:
@@ -39,6 +40,7 @@ stdenv.mkDerivation (finalAttrs: {
     yarnConfigHook
     nodejs
     yarn
+    node-gyp
     python3
     pkg-config
     makeWrapper
@@ -47,7 +49,7 @@ stdenv.mkDerivation (finalAttrs: {
   buildInputs = [
     libsecret
     libxkbfile
-    xorg.libX11
+    libx11
   ];
 
   strictDeps = true;
@@ -57,41 +59,51 @@ stdenv.mkDerivation (finalAttrs: {
   # Native Node addons must build against the Node runtime supplied by Nix.
   npm_config_nodedir = nodejs;
 
-  # The browser target does not need Electron downloads.
+  # The browser target does not need Electron or Puppeteer browser downloads.
   ELECTRON_SKIP_BINARY_DOWNLOAD = "1";
+  PUPPETEER_SKIP_DOWNLOAD = "1";
+  PUPPETEER_SKIP_CHROMIUM_DOWNLOAD = "1";
 
   postPatch = ''
-    # Resource-conscious native build: keep only the official browser application
-    # and the product extension as Yarn workspaces. This avoids installing/building
-    # the Electron, updater, launcher, and next-channel workspaces.
-    python3 - <<'PY'
-import json
-from pathlib import Path
-p = Path("package.json")
-data = json.loads(p.read_text())
-data["workspaces"] = ["applications/browser", "theia-extensions/product"]
-p.write_text(json.dumps(data, indent=2) + "\n")
-PY
+        # Resource-conscious native build: keep only the official browser application
+        # and the product extension as Yarn workspaces. This avoids installing/building
+        # the Electron, updater, launcher, and next-channel workspaces.
+        python3 - <<'PY'
+    import json
+    from pathlib import Path
+    p = Path("package.json")
+    data = json.loads(p.read_text())
+    data["workspaces"] = ["applications/browser", "theia-extensions/product"]
+    p.write_text(json.dumps(data, indent=2) + "\n")
+
+    prod_pkg = Path("theia-extensions/product/package.json")
+    prod_data = json.loads(prod_pkg.read_text())
+    if "theiaExtensions" in prod_data:
+        for ext in prod_data["theiaExtensions"]:
+            ext.pop("electronMain", None)
+    prod_pkg.write_text(json.dumps(prod_data, indent=2) + "\n")
+    PY
+
+        rm -rf theia-extensions/product/src/electron-main
+  '';
+
+  preConfigure = ''
+    export HOME="$TMPDIR/home"
+    mkdir -p "$HOME"
   '';
 
   buildPhase = ''
     runHook preBuild
 
-    export HOME="$TMPDIR/home"
-    mkdir -p "$HOME"
-
     # Match the upstream browser build, but deliberately skip download:plugins.
     # That avoids bundling the large VS Code extension pack and language toolchains.
     yarn --offline build:extensions
 
-    ${if production then
-      ''yarn --offline browser build:prod''
-    else
-      ''yarn --offline browser build''}
+    ${if production then "yarn --offline browser build:prod" else "yarn --offline browser build"}
 
     # Upstream performs a second install after generating the application so that
     # applications/browser carries the runtime dependency layout it needs.
-    yarn --offline --pure-lockfile
+    yarn --offline --pure-lockfile --ignore-scripts
 
     # Follow the upstream browser image cleanup strategy to avoid shipping root
     # development dependencies. Keep the generated browser application and the
@@ -99,6 +111,14 @@ PY
     yarn autoclean --init
     printf '%s\n' '*.ts' '*.ts.map' '*.spec.*' >> .yarnclean
     yarn autoclean --force
+    # Rebuild native addon for drivelist and place it into browser runtime modules
+    (
+      cd node_modules/drivelist
+      node-gyp rebuild
+    )
+    mkdir -p applications/browser/node_modules/drivelist/build/Release
+    cp -r node_modules/drivelist/package.json node_modules/drivelist/js applications/browser/node_modules/drivelist/
+    cp node_modules/drivelist/build/Release/drivelist.node applications/browser/node_modules/drivelist/build/Release/
 
     rm -rf \
       .git \
@@ -107,6 +127,9 @@ PY
       applications/electron-next \
       theia-extensions/launcher \
       theia-extensions/updater
+
+    # Clean up dangling symlinks created by pruned build/root workspaces
+    find . -xtype l -delete
 
     test -f applications/browser/lib/backend/main.js
     test -d applications/browser/node_modules
@@ -125,7 +148,13 @@ PY
       --set-default NODE_ENV production \
       --set-default USE_LOCAL_GIT true \
       --set-default SHELL ${bashInteractive}/bin/bash \
-      --prefix PATH : ${lib.makeBinPath [ bashInteractive gitMinimal openssh ]}
+      --prefix PATH : ${
+        lib.makeBinPath [
+          bashInteractive
+          gitMinimal
+          openssh
+        ]
+      }
 
     runHook postInstall
   '';

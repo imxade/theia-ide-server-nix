@@ -5,9 +5,15 @@ root="${THEIA_REPO_ROOT:-$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/.." && pwd)}
 source_file="$root/source.nix"
 fake='sha256-AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA='
 
-version="$(nix eval --raw --file "$source_file" version)"
-src_hash="$(nix eval --raw --file "$source_file" srcHash)"
-yarn_hash="$(nix eval --raw --file "$source_file" yarnHash)"
+if command -v nix-instantiate >/dev/null 2>&1; then
+  version="$(nix-instantiate --eval --expr "(import $source_file).version" | tr -d '"')"
+  src_hash="$(nix-instantiate --eval --expr "(import $source_file).srcHash" | tr -d '"')"
+  yarn_hash="$(nix-instantiate --eval --expr "(import $source_file).yarnHash" | tr -d '"')"
+else
+  version="$(nix --extra-experimental-features 'nix-command flakes' eval --raw --file "$source_file" version)"
+  src_hash="$(nix --extra-experimental-features 'nix-command flakes' eval --raw --file "$source_file" srcHash)"
+  yarn_hash="$(nix --extra-experimental-features 'nix-command flakes' eval --raw --file "$source_file" yarnHash)"
+fi
 
 [[ "$version" =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]] || {
   echo "invalid stable version in source.nix: $version" >&2

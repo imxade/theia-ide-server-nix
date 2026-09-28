@@ -40,7 +40,7 @@ jobs:
         if: steps.change.outputs.changed == 'true'
         shell: bash
         run: |
-          version="$(nix eval --raw --file source.nix version)"
+          version="$(nix --extra-experimental-features 'nix-command flakes' eval --raw --file source.nix version)"
           git config user.name "theia-nix updater"
           git config user.email "github-actions[bot]@users.noreply.github.com"
           git add source.nix

@@ -1,12 +1,13 @@
 #!/usr/bin/env bash
 set -euo pipefail
+set -m
 
 root="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/.." && pwd)"
 cd "$root"
 
 package="${THEIA_PACKAGE:-theia-ide-server}"
 
-for cmd in nix curl python3; do
+for cmd in curl python3 ps awk; do
   command -v "$cmd" >/dev/null 2>&1 || {
     echo "required command not found: $cmd" >&2
     exit 1
@@ -29,32 +30,65 @@ log="$tmp/theia.log"
 mkdir -p "$workspace" "$home"
 
 cleanup() {
+  trap - EXIT INT TERM
   if [[ -n "${pid:-}" ]] && kill -0 "$pid" 2>/dev/null; then
-    kill "$pid" 2>/dev/null || true
+    kill -TERM "-$pid" 2>/dev/null || true
+    for _ in {1..30}; do
+      if ! kill -0 "$pid" 2>/dev/null; then
+        break
+      fi
+      sleep 0.1
+    done
+    if kill -0 "$pid" 2>/dev/null; then
+      kill -KILL "-$pid" 2>/dev/null || true
+    fi
     wait "$pid" 2>/dev/null || true
   fi
   rm -rf "$tmp"
 }
 trap cleanup EXIT INT TERM
 
-HOME="$home" XDG_CONFIG_HOME="$home/config" XDG_DATA_HOME="$home/data" \
-  nix run ".#$package" -- \
-    "$workspace" \
-    --hostname=127.0.0.1 \
-    --port="$port" \
-    --no-cluster \
-    >"$log" 2>&1 &
-pid=$!
+# Ensure headless execution: no reliance on DISPLAY or WAYLAND_DISPLAY
+unset DISPLAY
+unset WAYLAND_DISPLAY
+
+bin=""
+if [[ -x "$root/result/bin/$package" ]]; then
+  bin="$root/result/bin/$package"
+elif [[ -x "$root/result-$package/bin/$package" ]]; then
+  bin="$root/result-$package/bin/$package"
+fi
+
+started_at="$(date +%s%N 2>/dev/null || date +%s)"
+
+if [[ -n "$bin" ]]; then
+  HOME="$home" XDG_CONFIG_HOME="$home/config" XDG_DATA_HOME="$home/data" \
+    "$bin" \
+      "$workspace" \
+      --hostname=127.0.0.1 \
+      --port="$port" \
+      --no-cluster \
+      >"$log" 2>&1 &
+  pid=$!
+else
+  HOME="$home" XDG_CONFIG_HOME="$home/config" XDG_DATA_HOME="$home/data" \
+    nix --extra-experimental-features 'nix-command flakes' run ".#$package" -- \
+      "$workspace" \
+      --hostname=127.0.0.1 \
+      --port="$port" \
+      --no-cluster \
+      >"$log" 2>&1 &
+  pid=$!
+fi
 
 ready=0
-started_at="$(date +%s)"
 for _ in $(seq 1 120); do
   if ! kill -0 "$pid" 2>/dev/null; then
     echo "Theia exited before becoming ready" >&2
     cat "$log" >&2
     exit 1
   fi
-  if curl --fail --silent --show-error --max-time 2 "http://127.0.0.1:$port/" -o "$tmp/index.html"; then
+  if curl --fail --silent --show-error --max-time 2 "http://127.0.0.1:$port/" -o "$tmp/index.html" 2>/dev/null && [[ -s "$tmp/index.html" ]]; then
     ready=1
     break
   fi
@@ -67,16 +101,79 @@ if (( ready == 0 )); then
   exit 1
 fi
 
-[[ -s "$tmp/index.html" ]] || {
-  echo "Theia returned an empty HTML response" >&2
+# Validate response content
+if ! grep -qi 'theia' "$tmp/index.html"; then
+  echo "Theia returned non-Theia HTML content" >&2
+  head -n 30 "$tmp/index.html" >&2
   exit 1
-}
+fi
 
-sleep 2
-rss_kib="$(ps -o rss= -p "$pid" 2>/dev/null | tr -d ' ' || true)"
-ready_at="$(date +%s)"
+# Validate essential static asset fetching
+asset="$(grep -o -E 'href="(\./[^"]+\.css)"' "$tmp/index.html" | head -n1 | cut -d'"' -f2 | sed 's#^\./##' || true)"
+if [[ -z "$asset" ]]; then
+  asset="$(grep -o -E 'href="(\./[^"]+)"' "$tmp/index.html" | head -n1 | cut -d'"' -f2 | sed 's#^\./##' || true)"
+fi
+if [[ -n "$asset" ]]; then
+  curl --fail --silent --show-error --max-time 5 "http://127.0.0.1:$port/$asset" -o "$tmp/asset"
+  [[ -s "$tmp/asset" ]] || {
+    echo "Failed to fetch static asset: $asset" >&2
+    exit 1
+  }
+fi
+
+ready_at="$(date +%s%N 2>/dev/null || date +%s)"
+sleep 1
+
+# Measure process metrics using python3
+metrics="$(python3 - "$pid" <<'PY'
+import sys, subprocess
+
+main_pid = int(sys.argv[1])
+try:
+    out = subprocess.check_output(["ps", "-o", "pid,ppid,rss", "-A"]).decode()
+    lines = out.strip().split("\n")[1:]
+    proc_map = {}
+    for line in lines:
+        parts = line.split()
+        if len(parts) >= 3:
+            p, pp, rss = int(parts[0]), int(parts[1]), int(parts[2])
+            proc_map[p] = (pp, rss)
+
+    descendants = [main_pid]
+    added = True
+    while added:
+        added = False
+        for p, (pp, rss) in proc_map.items():
+            if pp in descendants and p not in descendants:
+                descendants.append(p)
+                added = True
+
+    main_rss = proc_map.get(main_pid, (0, 0))[1]
+    total_rss = sum(proc_map[p][1] for p in descendants if p in proc_map)
+    child_count = len(descendants) - 1
+    print(f"{main_rss} {total_rss} {child_count}")
+except Exception:
+    print("0 0 0")
+PY
+)"
+
+main_rss="$(awk '{print $1}' <<<"$metrics")"
+total_rss="$(awk '{print $2}' <<<"$metrics")"
+child_count="$(awk '{print $3}' <<<"$metrics")"
+
+startup_time="N/A"
+if [[ ${#started_at} -gt 10 && ${#ready_at} -gt 10 ]]; then
+  diff_ns=$((ready_at - started_at))
+  startup_time="$(awk "BEGIN {printf \"%.2f\", $diff_ns / 1000000000}")"
+else
+  startup_time="$((ready_at - started_at))"
+fi
+
 printf 'Theia localhost smoke test passed: http://127.0.0.1:%s/\n' "$port"
-printf 'startup-to-HTTP-ready: %s seconds\n' "$((ready_at - started_at))"
-if [[ -n "$rss_kib" ]]; then
-  printf 'launcher process RSS at readiness: %s KiB\n' "$rss_kib"
+printf 'startup-to-HTTP-ready: %s seconds\n' "$startup_time"
+printf 'primary backend process RSS: %s KiB\n' "$main_rss"
+printf 'total process tree RSS: %s KiB\n' "$total_rss"
+printf 'child processes: %s\n' "$child_count"
+if [[ -n "$asset" ]]; then
+  printf 'verified static asset: %s\n' "$asset"
 fi
