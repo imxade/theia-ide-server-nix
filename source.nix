@@ -1,5 +1,5 @@
 {
-  version = "1.76.0";
-  srcHash = "sha256-K7YQjSM3sn0tQoiO+VueeCTjMvz+jyAPrpKoy2rDVUo=";
-  yarnHash = "sha256-W9rv1rD/hQgNn1gW6yinmVecffgh17j5Zi6xKpWyWpo=";
+  version = "1.76.1";
+  srcHash = "sha256-KG+m7PnIp7wd1ZLGheSPWCfvg1Ew3qJA0DgVjx10r4E=";
+  yarnHash = "sha256-ieOrXwpCzfDRUWD4BH1K1RdU25I9XenPkR5svUF6xdg=";
 }
